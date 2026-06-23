@@ -2,25 +2,23 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# install pnpm
+# Install pnpm
 RUN npm install -g pnpm
 
-# copy only what we need
+# Copy workspace files
 COPY package.json .
 COPY pnpm-workspace.yaml .
 COPY tsconfig.json .
 COPY tsconfig.base.json .
 
+# Copy source code
 COPY lib ./lib
 COPY artifacts/api-server ./artifacts/api-server
 
-# install dependencies
+# Install dependencies
 RUN pnpm install --no-frozen-lockfile
 
-# build API server
-RUN pnpm --filter api-server build || true
-
-# fallback build
+# Build API server
 RUN cd artifacts/api-server && pnpm install && pnpm run build
 
 EXPOSE 8080

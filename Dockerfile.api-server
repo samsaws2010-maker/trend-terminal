@@ -5,25 +5,25 @@ WORKDIR /app
 # Install pnpm
 RUN npm install -g pnpm
 
-# Copy package files first (better Docker caching)
+# Copy package files
 COPY package.json .
 COPY pnpm-workspace.yaml .
 COPY tsconfig.json .
 COPY tsconfig.base.json .
 
-# Copy workspace packages
+# Copy workspace code
 COPY lib ./lib
 COPY artifacts/api-server ./artifacts/api-server
 COPY scripts ./scripts
 
-# Install dependencies
+# Install dependencies (clean + Render-safe)
 ENV PNPM_ENABLE_SCRIPTS=1
 ENV PNPM_CONFIG_IGNORE_SCRIPTS=false
 ENV PNPM_STRICT_PEER_DEPENDENCIES=false
 
 RUN pnpm install --no-frozen-lockfile
 
-# Build ONLY the API server (IMPORTANT FIX)
+# Build ONLY API server (IMPORTANT)
 RUN pnpm -C artifacts/api-server install
 RUN pnpm -C artifacts/api-server build
 

@@ -16,9 +16,12 @@ COPY lib ./lib
 COPY artifacts/api-server ./artifacts/api-server
 COPY scripts ./scripts
 
-# Install dependencies
+# Install dependencies (FIXED for Render + pnpm + esbuild issue)
 ENV PNPM_ENABLE_SCRIPTS=1
-RUN pnpm install --no-frozen-lockfile --unsafe-perm --ignore-scripts=false
+ENV PNPM_CONFIG_IGNORE_SCRIPTS=false
+ENV PNPM_STRICT_PEER_DEPENDENCIES=false
+
+RUN pnpm install --no-frozen-lockfile
 
 # Build
 RUN pnpm run build

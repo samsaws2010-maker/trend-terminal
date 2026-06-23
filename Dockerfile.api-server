@@ -17,7 +17,8 @@ COPY artifacts/api-server ./artifacts/api-server
 COPY scripts ./scripts
 
 # Install dependencies
-RUN pnpm install --no-frozen-lockfile
+ENV PNPM_ENABLE_SCRIPTS=1
+RUN pnpm install --no-frozen-lockfile --unsafe-perm --ignore-scripts=false
 
 # Build
 RUN pnpm run build

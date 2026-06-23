@@ -1,0 +1,44 @@
+version: "3.8"
+
+services:
+  classifier:
+    build:
+      context: .
+      dockerfile: Dockerfile.classifier
+    ports:
+      - "5100:5100"
+    environment:
+      - PYTHON_SERVICE_PORT=5100
+      - FLASK_ENV=production
+    volumes:
+      - ./artifacts/api-server/python/cache:/app/cache
+      - ./artifacts/api-server/data:/app/data
+    restart: unless-stopped
+
+  api-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.api-server
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - PYTHON_SERVICE_PORT=5100
+      - PYTHON_SERVICE_HOST=classifier
+      - BASE_PATH=/api
+    depends_on:
+      - classifier
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - BASE_PATH=/
+    depends_on:
+      - api-server
+    restart: unless-stopped

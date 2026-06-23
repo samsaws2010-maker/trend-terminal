@@ -1,0 +1,32 @@
+FROM node:24-alpine
+
+WORKDIR /app
+
+# Install pnpm
+RUN npm install -g pnpm
+
+# Copy package files
+COPY package.json .
+COPY pnpm-workspace.yaml .
+COPY tsconfig.json .
+COPY tsconfig.base.json .
+
+# Copy workspace packages
+COPY lib ./lib
+COPY artifacts/api-server ./artifacts/api-server
+COPY scripts ./scripts
+
+# Install dependencies
+RUN pnpm install
+
+# Build
+RUN pnpm run build
+
+EXPOSE 8080
+
+ENV PORT=8080
+ENV PYTHON_SERVICE_PORT=5100
+ENV PYTHON_SERVICE_HOST=classifier
+ENV BASE_PATH=/api
+
+CMD ["node", "artifacts/api-server/dist/index.js"]

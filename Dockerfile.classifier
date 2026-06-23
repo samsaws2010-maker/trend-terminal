@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libxml2-dev \
+    libxslt1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Python files
+COPY artifacts/api-server/python/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY artifacts/api-server/python/stock_data_service.py .
+COPY artifacts/api-server/python/cache ./cache
+
+# Create cache directory
+RUN mkdir -p cache
+
+EXPOSE 5100
+
+CMD ["python3", "stock_data_service.py"]

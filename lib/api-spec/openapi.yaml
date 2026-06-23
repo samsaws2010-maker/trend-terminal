@@ -1,0 +1,457 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: The Trend Terminal - WSB Meme Stock Investigator API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: wsb
+    description: WallStreetBets post data and sentiment
+  - name: stocks
+    description: Stock price data
+  - name: classify
+    description: Post classification
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /wsb/posts:
+    get:
+      operationId: listPosts
+      tags: [wsb]
+      summary: List WSB posts
+      description: Returns paginated list of labeled WSB posts with optional filters
+      parameters:
+        - name: sentiment
+          in: query
+          schema:
+            type: string
+            enum: [Positive, Negative, Neutral]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: search
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of posts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PostList"
+
+  /wsb/summary:
+    get:
+      operationId: getSentimentSummary
+      tags: [wsb]
+      summary: Sentiment summary
+      description: Returns overall sentiment counts and percentages
+      responses:
+        "200":
+          description: Sentiment summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SentimentSummary"
+
+  /wsb/top-tickers:
+    get:
+      operationId: getTopTickers
+      tags: [wsb]
+      summary: Top mentioned tickers
+      description: Returns most-mentioned tickers with sentiment breakdown
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+      responses:
+        "200":
+          description: Top tickers
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TickerSummary"
+
+  /wsb/recent-activity:
+    get:
+      operationId: getRecentActivity
+      tags: [wsb]
+      summary: Recent post activity
+      description: Returns recent posts sorted by date for the activity feed
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: Recent activity
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Post"
+
+  /wsb/sentiment-over-time:
+    get:
+      operationId: getSentimentOverTime
+      tags: [wsb]
+      summary: Sentiment trend over time
+      description: Returns daily sentiment counts grouped by date
+      responses:
+        "200":
+          description: Sentiment over time
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SentimentDataPoint"
+
+  /stocks/prices:
+    get:
+      operationId: getTickerPrices
+      tags: [stocks]
+      summary: Get ticker price snapshot
+      description: Returns pre-fetched price snapshot for known tickers
+      responses:
+        "200":
+          description: Ticker prices
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TickerPrice"
+
+  /stocks/{ticker}:
+    get:
+      operationId: getStockInfo
+      tags: [stocks]
+      summary: Get live stock info
+      description: Returns live stock price and metadata for a ticker
+      parameters:
+        - name: ticker
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Stock info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StockInfo"
+
+  /stocks/{ticker}/history:
+    get:
+      operationId: fetchStockHistory
+      tags: [stocks]
+      summary: Get price history
+      description: Returns OHLCV price history for a ticker
+      parameters:
+        - name: ticker
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: period
+          in: query
+          schema:
+            type: string
+            default: 1mo
+            enum: [1wk, 1mo, 3mo, 6mo, 1y]
+      responses:
+        "200":
+          description: Price history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PricePoint"
+
+  /classify:
+    post:
+      operationId: classifyPost
+      tags: [classify]
+      summary: Classify a WSB post
+      description: Classifies a WSB post as Positive, Negative, or Neutral using OpenAI
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClassifyInput"
+      responses:
+        "200":
+          description: Classification result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClassifyResult"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    Post:
+      type: object
+      properties:
+        post_id:
+          type: string
+        title:
+          type: string
+        flair:
+          type: ["string", "null"]
+        score:
+          type: ["integer", "null"]
+        num_comments:
+          type: ["integer", "null"]
+        date_utc:
+          type: ["string", "null"]
+        url:
+          type: ["string", "null"]
+        ticker:
+          type: ["string", "null"]
+        sentiment:
+          type: string
+          enum: [Positive, Negative, Neutral]
+        classification_method:
+          type: ["string", "null"]
+      required:
+        - post_id
+        - title
+        - sentiment
+
+    PostList:
+      type: object
+      properties:
+        posts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Post"
+        total:
+          type: integer
+        offset:
+          type: integer
+        limit:
+          type: integer
+      required:
+        - posts
+        - total
+        - offset
+        - limit
+
+    SentimentCount:
+      type: object
+      properties:
+        count:
+          type: integer
+        pct:
+          type: number
+      required:
+        - count
+        - pct
+
+    SentimentSummary:
+      type: object
+      properties:
+        Positive:
+          $ref: "#/components/schemas/SentimentCount"
+        Negative:
+          $ref: "#/components/schemas/SentimentCount"
+        Neutral:
+          $ref: "#/components/schemas/SentimentCount"
+        total:
+          type: integer
+      required:
+        - Positive
+        - Negative
+        - Neutral
+        - total
+
+    TickerSummary:
+      type: object
+      properties:
+        ticker:
+          type: string
+        mention_count:
+          type: integer
+        positive_pct:
+          type: number
+        negative_pct:
+          type: number
+        neutral_pct:
+          type: number
+        dominant_sentiment:
+          type: string
+      required:
+        - ticker
+        - mention_count
+        - positive_pct
+        - negative_pct
+        - neutral_pct
+        - dominant_sentiment
+
+    SentimentDataPoint:
+      type: object
+      properties:
+        date:
+          type: string
+        Positive:
+          type: integer
+        Negative:
+          type: integer
+        Neutral:
+          type: integer
+      required:
+        - date
+        - Positive
+        - Negative
+        - Neutral
+
+    TickerPrice:
+      type: object
+      properties:
+        ticker:
+          type: string
+        name:
+          type: ["string", "null"]
+        current_price:
+          type: ["number", "null"]
+        price_change_pct:
+          type: ["number", "null"]
+        market_cap:
+          type: ["number", "null"]
+        week_52_high:
+          type: ["number", "null"]
+        week_52_low:
+          type: ["number", "null"]
+        sector:
+          type: ["string", "null"]
+      required:
+        - ticker
+
+    StockInfo:
+      type: object
+      properties:
+        ticker:
+          type: string
+        name:
+          type: string
+        sector:
+          type: string
+        industry:
+          type: string
+        current_price:
+          type: number
+        previous_close:
+          type: number
+        price_change:
+          type: number
+        price_change_pct:
+          type: number
+        market_cap:
+          type: ["number", "null"]
+        week_52_high:
+          type: ["number", "null"]
+        week_52_low:
+          type: ["number", "null"]
+        description:
+          type: string
+        error:
+          type: ["string", "null"]
+      required:
+        - ticker
+        - name
+        - sector
+        - industry
+        - current_price
+        - previous_close
+        - price_change
+        - price_change_pct
+        - description
+
+    PricePoint:
+      type: object
+      properties:
+        date:
+          type: string
+        open:
+          type: ["number", "null"]
+        high:
+          type: ["number", "null"]
+        low:
+          type: ["number", "null"]
+        close:
+          type: ["number", "null"]
+        volume:
+          type: ["number", "null"]
+      required:
+        - date
+
+    ClassifyInput:
+      type: object
+      properties:
+        text:
+          type: string
+        flair:
+          type: ["string", "null"]
+      required:
+        - text
+
+    ClassifyResult:
+      type: object
+      properties:
+        sentiment:
+          type: string
+          enum: [Positive, Negative, Neutral]
+        method:
+          type: string
+        ticker:
+          type: ["string", "null"]
+        confidence:
+          type: string
+      required:
+        - sentiment
+        - method
+        - confidence

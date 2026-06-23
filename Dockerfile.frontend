@@ -1,0 +1,32 @@
+FROM node:24-alpine
+
+WORKDIR /app
+
+# Install pnpm
+RUN npm install -g pnpm
+
+# Copy package files
+COPY package.json .
+COPY pnpm-workspace.yaml .
+COPY tsconfig.json .
+COPY tsconfig.base.json .
+
+# Copy workspace packages
+COPY lib ./lib
+COPY artifacts/trend-terminal ./artifacts/trend-terminal
+
+# Install dependencies
+RUN pnpm install
+
+# Build
+RUN pnpm --filter @workspace/trend-terminal run build
+
+EXPOSE 3000
+
+ENV PORT=3000
+ENV BASE_PATH=/
+
+# Serve static files
+RUN npm install -g serve
+
+CMD ["serve", "-s", "artifacts/trend-terminal/dist", "-l", "3000"]

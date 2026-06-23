@@ -1,0 +1,1484 @@
+"""
+classifier_service.py — Flask microservice wrapping the WSB classifier + stock data
+Runs alongside the Node API server. Node proxies /api/classify and /api/wsb/* and /api/stocks/* to this service.
+"""
+import os
+import sys
+import json
+import math
+import threading
+import urllib.parse
+from pathlib import Path
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+# Add extracted assets to path so we can import the user's modules
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+EXTRACTED_DIR = WORKSPACE_ROOT / "attached_assets" / "extracted"
+sys.path.insert(0, str(EXTRACTED_DIR))
+
+# Persistent disk cache for picks — uses workspace dir (survives deploys in Replit)
+_CACHE_DIR = Path(__file__).resolve().parent / "cache"
+_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_PICKS_DISK_PATH = _CACHE_DIR / "picks_cache.json"
+_DETAIL_DISK_PATH = _CACHE_DIR / "stock_detail_cache.json"
+
+import pandas as pd
+from meme_stock_classifier import (
+    classify_post,
+    load_labeled_data,
+    get_sentiment_summary,
+    get_top_tickers,
+)
+from stock_data import get_stock_info, load_ticker_prices, get_price_history
+
+app = Flask(__name__)
+CORS(app)
+
+# ── Load data once at startup ──────────────────────────────────────────────────
+df: pd.DataFrame = pd.DataFrame()
+
+def _load_data():
+    global df
+    try:
+        df = load_labeled_data(str(EXTRACTED_DIR / "wsb_labeled.csv"))
+        # Ensure ticker column exists
+        if "ticker" not in df.columns:
+            df["ticker"] = None
+        print(f"[classifier_service] Loaded {len(df)} posts", flush=True)
+    except Exception as e:
+        print(f"[classifier_service] Error loading data: {e}", flush=True)
+
+_load_data()
+
+
+def _safe(val):
+    """Convert NaN/inf to None for JSON serialisation."""
+    if val is None:
+        return None
+    try:
+        if math.isnan(val) or math.isinf(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return val
+
+
+# ── Shared web scraping helpers ───────────────────────────
+
+import requests
+from datetime import datetime
+
+_WEB_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+}
+
+def _web_fetch_json(url: str, timeout: int = 10) -> dict | None:
+    try:
+        r = requests.get(url, headers=_WEB_HEADERS, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+        return None
+    except Exception:
+        return None
+
+def _web_fetch_news(ticker: str, limit: int = 20) -> list:
+    """Fetch news articles via Google News RSS — no auth, no Yahoo dependency."""
+    import urllib.request
+    import xml.etree.ElementTree as ET
+    try:
+        query = urllib.parse.quote(f"{ticker} stock")
+        url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            root = ET.fromstring(r.read())
+        articles = []
+        for item in root.findall(".//item")[:limit]:
+            title = item.findtext("title", "").strip()
+            if not title:
+                continue
+            # Google News appends " - Provider" to titles — strip it for cleaner display
+            source_el = item.find("source")
+            provider = source_el.text.strip() if source_el is not None else "Web"
+            if title.endswith(f" - {provider}"):
+                title = title[: -(len(provider) + 3)].strip()
+            articles.append({
+                "title": title,
+                "provider": provider,
+                "pub_date": item.findtext("pubDate", ""),
+                "url": item.findtext("link", ""),
+            })
+        return articles
+    except Exception:
+        return []
+
+def _web_fetch_stock_summary(ticker: str) -> dict:
+    """Fetch stock summary data via yfinance library."""
+    try:
+        import yfinance as yf
+        import requests
+        # Use a browser-like session to avoid Yahoo rate limiting on server IPs
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        t = yf.Ticker(ticker, session=session)
+        info = t.info
+        if not info:
+            app.logger.warning(f"[yfinance] empty info for {ticker}")
+            return {}
+        # yfinance returns {"trailingPegRatio": None} dict even on failure for some tickers;
+        # check for a meaningful field to confirm we have real data
+        if not info.get("regularMarketPrice") and not info.get("currentPrice") and not info.get("previousClose"):
+            app.logger.warning(f"[yfinance] no price fields for {ticker}, keys={list(info.keys())[:8]}")
+            return {}
+
+        # Pull stockholders equity from quarterly balance sheet — not available in .info
+        total_equity = None
+        try:
+            bs = t.quarterly_balance_sheet
+            if bs is not None and not bs.empty:
+                for row_name in ("Stockholders Equity", "Common Stock Equity",
+                                 "Total Equity Gross Minority Interest"):
+                    if row_name in bs.index:
+                        val = bs.loc[row_name].iloc[0]
+                        if val is not None and not (isinstance(val, float) and math.isnan(val)):
+                            total_equity = float(val)
+                            break
+        except Exception:
+            pass
+
+        # Convert yfinance dict format to the same format as the old API
+        # so _web_extract_info() works unchanged
+        return {
+            "price": {"longName": info.get("longName"), "shortName": info.get("shortName"),
+                      "regularMarketPrice": {"raw": info.get("currentPrice")},
+                      "regularMarketChangePercent": {"raw": info.get("regularMarketChangePercent")},
+                      "marketCap": {"raw": info.get("marketCap")},
+                      "previousClose": {"raw": info.get("previousClose")},
+                      },
+            "stats": {"trailingPE": {"raw": info.get("trailingPE")},
+                      "forwardPE": {"raw": info.get("forwardPE")},
+                      "priceToBook": {"raw": info.get("priceToBook")},
+                      "beta": {"raw": info.get("beta")},
+                      "trailingEps": {"raw": info.get("trailingEps")},
+                      "bookValue": {"raw": info.get("bookValue")},
+                      "sharesOutstanding": {"raw": info.get("sharesOutstanding")},
+                      "targetMeanPrice": {"raw": info.get("targetMeanPrice")},
+                      "targetHighPrice": {"raw": info.get("targetHighPrice")},
+                      "targetLowPrice": {"raw": info.get("targetLowPrice")},
+                      "recommendationKey": {"raw": info.get("recommendationKey")},
+                      "recommendationMean": {"raw": info.get("recommendationMean")},
+                      "numberOfAnalystOpinions": {"raw": info.get("numberOfAnalystOpinions")},
+                      "enterpriseToEbitda": {"raw": info.get("enterpriseToEbitda")},
+                      "sector": {"raw": info.get("sector")},
+                      "industry": {"raw": info.get("industry")},
+                      },
+            "summary": {"fiftyTwoWeekLow": {"raw": info.get("fiftyTwoWeekLow")},
+                        "fiftyTwoWeekHigh": {"raw": info.get("fiftyTwoWeekHigh")},
+                        "dividendYield": {"raw": info.get("dividendYield")},
+                        },
+            "fin": {"profitMargins": {"raw": info.get("profitMargins")},
+                    "revenueGrowth": {"raw": info.get("revenueGrowth")},
+                    "earningsGrowth": {"raw": info.get("earningsGrowth")},
+                    "debtToEquity": {"raw": info.get("debtToEquity")},
+                    "currentRatio": {"raw": info.get("currentRatio")},
+                    "quickRatio": {"raw": info.get("quickRatio")},
+                    "returnOnEquity": {"raw": info.get("returnOnEquity")},
+                    "returnOnAssets": {"raw": info.get("returnOnAssets")},
+                    "operatingMargins": {"raw": info.get("operatingMargins")},
+                    "operatingCashflow": {"raw": info.get("operatingCashflow")},
+                    "freeCashflow": {"raw": info.get("freeCashflow")},
+                    "totalDebt": {"raw": info.get("totalDebt")},
+                    "enterpriseValue": {"raw": info.get("enterpriseValue")},
+                    "totalStockholderEquity": {"raw": total_equity},
+                    },
+        }
+    except Exception as e:
+        app.logger.error(f"[yfinance] _web_fetch_stock_summary({ticker}) failed: {e}")
+        return {}
+
+def _web_fetch_chart(ticker: str) -> dict:
+    """Fetch chart data via yfinance library."""
+    try:
+        import yfinance as yf
+        import requests
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+        })
+        t = yf.Ticker(ticker, session=session)
+        hist = t.history(period="1mo")
+        if hist.empty:
+            return {}
+        chart_data = []
+        for idx, row in hist.iterrows():
+            dt = idx.strftime("%Y-%m-%d")
+            close = float(row.get("Close", 0))
+            if close > 0:
+                chart_data.append({"date": dt, "close": round(close, 2)})
+        price = None
+        change_pct = None
+        if not hist.empty:
+            price = float(hist.iloc[-1].get("Close", 0))
+            if len(hist) > 1:
+                prev = float(hist.iloc[-2].get("Close", 0))
+                if prev > 0:
+                    change_pct = round((price - prev) / prev * 100, 2)
+        return {
+            "price": price,
+            "change_pct": change_pct,
+            "prev_close": float(hist.iloc[-2].get("Close", 0)) if len(hist) > 1 else None,
+            "chart": chart_data,
+        }
+    except Exception as e:
+        app.logger.error(f"[yfinance] _web_fetch_chart({ticker}) failed: {e}")
+        return {}
+
+def _web_extract_info(summary: dict) -> dict:
+    """Convert web-scraped quote summary to a flat dict compatible with existing code."""
+    s = summary.get("summary", {})
+    st = summary.get("stats", {})
+    f = summary.get("fin", {})
+    p = summary.get("price", {})
+
+    def _get(obj, key):
+        v = obj.get(key)
+        return v.get("raw") if isinstance(v, dict) else v
+
+    return {
+        "longName": p.get("longName") or p.get("shortName"),
+        "currentPrice": _get(p, "regularMarketPrice") or _get(p, "previousClose"),
+        "regularMarketPrice": _get(p, "regularMarketPrice"),
+        "regularMarketChangePercent": _get(p, "regularMarketChangePercent"),
+        "marketCap": _get(p, "marketCap") or _get(s, "marketCap"),
+        "trailingPE": _get(st, "trailingPE"),
+        "forwardPE": _get(st, "forwardPE"),
+        "priceToBook": _get(st, "priceToBook"),
+        "beta": _get(st, "beta"),
+        "trailingEps": _get(st, "trailingEps"),
+        "bookValue": _get(st, "bookValue"),
+        "sharesOutstanding": _get(st, "sharesOutstanding"),
+        "targetMeanPrice": _get(st, "targetMeanPrice"),
+        "targetHighPrice": _get(st, "targetHighPrice"),
+        "targetLowPrice": _get(st, "targetLowPrice"),
+        "recommendationKey": _get(st, "recommendationKey"),
+        "recommendationMean": _get(st, "recommendationMean"),
+        "numberOfAnalystOpinions": _get(st, "numberOfAnalystOpinions"),
+        "fiftyTwoWeekLow": _get(s, "fiftyTwoWeekLow"),
+        "fiftyTwoWeekHigh": _get(s, "fiftyTwoWeekHigh"),
+        "dividendYield": _get(s, "dividendYield"),
+        "profitMargins": _get(f, "profitMargins"),
+        "revenueGrowth": _get(f, "revenueGrowth"),
+        "earningsGrowth": _get(f, "earningsGrowth"),
+        "debtToEquity": _get(f, "debtToEquity"),
+        "currentRatio": _get(f, "currentRatio"),
+        "quickRatio": _get(f, "quickRatio"),
+        "returnOnEquity": _get(f, "returnOnEquity"),
+        "returnOnAssets": _get(f, "returnOnAssets"),
+        "operatingMargins": _get(f, "operatingMargins"),
+        "operatingCashflow": _get(f, "operatingCashflow"),
+        "freeCashflow": _get(f, "freeCashflow"),
+        "totalDebt": _get(f, "totalDebt"),
+        "enterpriseValue": _get(f, "enterpriseValue"),
+        "totalStockholderEquity": _get(f, "totalStockholderEquity"),
+        "enterpriseToEbitda": _get(st, "enterpriseToEbitda"),
+        "sector": _get(st, "sector"),
+        "industry": _get(st, "industry"),
+    }
+
+
+def _clean_row(row: dict) -> dict:
+    return {k: _safe(v) if isinstance(v, float) else v for k, v in row.items()}
+
+
+# ── Health ─────────────────────────────────────────────────────────────────────
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True})
+
+
+# ── WSB Posts ──────────────────────────────────────────────────────────────────
+
+@app.route("/internal/wsb/posts")
+def list_posts():
+    global df
+    if df.empty:
+        return jsonify({"posts": [], "total": 0, "offset": 0, "limit": 50})
+
+    sentiment_filter = request.args.get("sentiment")
+    search = request.args.get("search", "").strip().lower()
+    limit = int(request.args.get("limit", 50))
+    offset = int(request.args.get("offset", 0))
+
+    filtered = df.copy()
+    if sentiment_filter:
+        filtered = filtered[filtered["sentiment"] == sentiment_filter]
+    if search:
+        filtered = filtered[filtered["title"].str.lower().str.contains(search, na=False)]
+
+    total = len(filtered)
+    page = filtered.iloc[offset: offset + limit]
+
+    posts = []
+    for _, row in page.iterrows():
+        date_val = row.get("date_utc")
+        if hasattr(date_val, "isoformat"):
+            date_str = date_val.isoformat()
+        else:
+            date_str = str(date_val) if date_val is not None and str(date_val) != "nan" else None
+
+        score_val = row.get("score")
+        try:
+            score_int = int(score_val) if score_val is not None and not (isinstance(score_val, float) and math.isnan(score_val)) else None
+        except (TypeError, ValueError):
+            score_int = None
+
+        num_comments_val = row.get("num_comments")
+        try:
+            nc_int = int(num_comments_val) if num_comments_val is not None and not (isinstance(num_comments_val, float) and math.isnan(num_comments_val)) else None
+        except (TypeError, ValueError):
+            nc_int = None
+
+        ticker_val = row.get("ticker")
+        ticker_str = str(ticker_val) if ticker_val is not None and str(ticker_val) not in ("nan", "None", "") else None
+
+        flair_val = row.get("flair")
+        flair_str = str(flair_val) if flair_val is not None and str(flair_val) not in ("nan", "None", "") else None
+
+        posts.append({
+            "post_id": str(row.get("post_id", "")),
+            "title": str(row.get("title", "")),
+            "flair": flair_str,
+            "score": score_int,
+            "num_comments": nc_int,
+            "date_utc": date_str,
+            "url": str(row.get("url")) if row.get("url") and str(row.get("url")) not in ("nan", "None", "") else None,
+            "ticker": ticker_str,
+            "sentiment": str(row.get("sentiment", "Neutral")),
+            "classification_method": str(row.get("classification_method")) if row.get("classification_method") and str(row.get("classification_method")) not in ("nan", "None") else None,
+        })
+
+    return jsonify({"posts": posts, "total": total, "offset": offset, "limit": limit})
+
+
+@app.route("/internal/wsb/summary")
+def sentiment_summary():
+    global df
+    if df.empty:
+        return jsonify({"Positive": {"count": 0, "pct": 0}, "Negative": {"count": 0, "pct": 0}, "Neutral": {"count": 0, "pct": 0}, "total": 0})
+    summary = get_sentiment_summary(df)
+    return jsonify(summary)
+
+
+@app.route("/internal/wsb/top-tickers")
+def top_tickers():
+    global df
+    n = int(request.args.get("limit", 10))
+    if df.empty:
+        return jsonify([])
+    tickers_df = get_top_tickers(df, n)
+    if tickers_df.empty:
+        return jsonify([])
+    rows = []
+    for _, row in tickers_df.iterrows():
+        rows.append({
+            "ticker": str(row["ticker"]),
+            "mention_count": int(row["mention_count"]),
+            "positive_pct": float(row.get("positive_pct", 0)),
+            "negative_pct": float(row.get("negative_pct", 0)),
+            "neutral_pct": float(row.get("neutral_pct", 0)),
+            "dominant_sentiment": str(row.get("dominant_sentiment", "Neutral")),
+        })
+    return jsonify(rows)
+
+
+@app.route("/internal/wsb/recent-activity")
+def recent_activity():
+    global df
+    limit = int(request.args.get("limit", 20))
+    if df.empty:
+        return jsonify([])
+
+    filtered = df.copy()
+    if "date_utc" in filtered.columns:
+        filtered = filtered.sort_values("date_utc", ascending=False)
+    page = filtered.head(limit)
+
+    posts = []
+    for _, row in page.iterrows():
+        date_val = row.get("date_utc")
+        if hasattr(date_val, "isoformat"):
+            date_str = date_val.isoformat()
+        else:
+            date_str = str(date_val) if date_val is not None and str(date_val) != "nan" else None
+
+        score_val = row.get("score")
+        try:
+            score_int = int(score_val) if score_val is not None and not (isinstance(score_val, float) and math.isnan(score_val)) else None
+        except (TypeError, ValueError):
+            score_int = None
+
+        ticker_val = row.get("ticker")
+        ticker_str = str(ticker_val) if ticker_val is not None and str(ticker_val) not in ("nan", "None", "") else None
+
+        flair_val = row.get("flair")
+        flair_str = str(flair_val) if flair_val is not None and str(flair_val) not in ("nan", "None", "") else None
+
+        posts.append({
+            "post_id": str(row.get("post_id", "")),
+            "title": str(row.get("title", "")),
+            "flair": flair_str,
+            "score": score_int,
+            "num_comments": None,
+            "date_utc": date_str,
+            "url": str(row.get("url")) if row.get("url") and str(row.get("url")) not in ("nan", "None", "") else None,
+            "ticker": ticker_str,
+            "sentiment": str(row.get("sentiment", "Neutral")),
+            "classification_method": None,
+        })
+    return jsonify(posts)
+
+
+@app.route("/internal/wsb/sentiment-over-time")
+def sentiment_over_time():
+    global df
+    if df.empty or "date_utc" not in df.columns:
+        return jsonify([])
+
+    tmp = df.copy()
+    tmp["date"] = pd.to_datetime(tmp["date_utc"], errors="coerce").dt.date
+    tmp = tmp.dropna(subset=["date"])
+
+    grouped = tmp.groupby(["date", "sentiment"]).size().unstack(fill_value=0).reset_index()
+    for col in ["Positive", "Negative", "Neutral"]:
+        if col not in grouped.columns:
+            grouped[col] = 0
+
+    result = []
+    for _, row in grouped.iterrows():
+        result.append({
+            "date": str(row["date"]),
+            "Positive": int(row.get("Positive", 0)),
+            "Negative": int(row.get("Negative", 0)),
+            "Neutral": int(row.get("Neutral", 0)),
+        })
+    return jsonify(result)
+
+
+# ── Stocks ─────────────────────────────────────────────────────────────────────
+
+@app.route("/internal/stocks/prices")
+def ticker_prices():
+    try:
+        prices_df = load_ticker_prices(str(EXTRACTED_DIR / "ticker_prices.csv"))
+        rows = []
+        for _, row in prices_df.iterrows():
+            rows.append({
+                "ticker": str(row.get("ticker", "")),
+                "name": str(row["name"]) if row.get("name") and str(row.get("name")) not in ("nan", "None") else None,
+                "current_price": _safe(float(row["current_price"])) if row.get("current_price") is not None else None,
+                "price_change_pct": _safe(float(row["price_change_pct"])) if row.get("price_change_pct") is not None else None,
+                "market_cap": _safe(float(row["market_cap"])) if row.get("market_cap") is not None else None,
+                "week_52_high": _safe(float(row["week_52_high"])) if row.get("week_52_high") is not None else None,
+                "week_52_low": _safe(float(row["week_52_low"])) if row.get("week_52_low") is not None else None,
+                "sector": str(row["sector"]) if row.get("sector") and str(row.get("sector")) not in ("nan", "None") else None,
+            })
+        return jsonify(rows)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/internal/stocks/<ticker>")
+def stock_info(ticker):
+    try:
+        info = get_stock_info(ticker.upper())
+        return jsonify({
+            "ticker": info["ticker"],
+            "name": info["name"],
+            "sector": info["sector"],
+            "industry": info["industry"],
+            "current_price": _safe(info["current_price"]) or 0.0,
+            "previous_close": _safe(info["previous_close"]) or 0.0,
+            "price_change": _safe(info["price_change"]) or 0.0,
+            "price_change_pct": _safe(info["price_change_pct"]) or 0.0,
+            "market_cap": _safe(info["market_cap"]),
+            "week_52_high": _safe(info["week_52_high"]),
+            "week_52_low": _safe(info["week_52_low"]),
+            "description": info["description"],
+            "error": info["error"],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/internal/stocks/<ticker>/history")
+def stock_history(ticker):
+    period = request.args.get("period", "1mo")
+    valid_periods = {"1wk", "1mo", "3mo", "6mo", "1y"}
+    if period not in valid_periods:
+        period = "1mo"
+    try:
+        hist = get_price_history(ticker.upper(), period=period)
+        if hist.empty:
+            return jsonify([])
+        result = []
+        for date, row in hist.iterrows():
+            result.append({
+                "date": str(date.date()) if hasattr(date, "date") else str(date),
+                "open": _safe(float(row.get("Open", 0))) if row.get("Open") is not None else None,
+                "high": _safe(float(row.get("High", 0))) if row.get("High") is not None else None,
+                "low": _safe(float(row.get("Low", 0))) if row.get("Low") is not None else None,
+                "close": _safe(float(row.get("Close", 0))) if row.get("Close") is not None else None,
+                "volume": _safe(float(row.get("Volume", 0))) if row.get("Volume") is not None else None,
+            })
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Web News Sentiment ────────────────────────────────────────────────────────
+
+import threading
+import time
+
+_WEB_CACHE: dict = {}          # ticker -> {"ts": float, "data": dict}
+_WEB_CACHE_TTL = 86_400      # 24 h cache per ticker
+
+_DEFAULT_TICKERS = [
+    "AAPL","MSFT","NVDA","GOOGL","AMZN","META","TSLA","AVGO","TSM","LLY",
+    "RDDT","CELH","MARA","HIMS",
+    "MCO","SPGI","MSCI",
+]
+
+
+def _web_news_for_ticker(ticker: str) -> dict:
+    """Fetch web news for a ticker, classify each headline, return stats."""
+    global _WEB_CACHE
+    now = time.time()
+    cached = _WEB_CACHE.get(ticker)
+    if cached and now - cached["ts"] < _WEB_CACHE_TTL:
+        return cached["data"]
+
+    try:
+        raw_news = _web_fetch_news(ticker.upper(), limit=20)
+    except Exception as e:
+        print(f"[web_news] Failed to fetch news for {ticker}: {e}", flush=True)
+        raw_news = []
+
+    articles = []
+    pos = neg = neu = 0
+    for item in raw_news[:20]:
+        title = item.get("title", "").strip()
+        if not title:
+            continue
+        provider = item.get("provider", "Web")
+        pub_date = item.get("pub_date", "")
+        url = item.get("url", "")
+        label = _classify_news_sentiment(title)
+        if label == "Positive":
+            pos += 1
+        elif label == "Negative":
+            neg += 1
+        else:
+            neu += 1
+        articles.append({
+            "title": title,
+            "provider": provider,
+            "pub_date": pub_date,
+            "url": url,
+            "label": label,
+        })
+
+    # Blended sentiment score: neutral articles count as 0.5 so they
+    # pull scores toward centre rather than being ignored entirely.
+    # Formula: (pos + neu*0.5) / total — ranges 0-100, anchored at 50 when
+    # all articles are neutral. This prevents 1 positive + 9 neutral = 100%.
+    total = pos + neg + neu
+    if total == 0:
+        positive_pct = 50.0
+        negative_pct = 50.0
+    else:
+        positive_pct = round((pos + neu * 0.5) / total * 100, 1)
+        negative_pct = round((neg + neu * 0.5) / total * 100, 1)
+    neutral_pct = round(neu / (total or 1) * 100, 1)
+
+    if pos > neg:
+        dominant = "Positive"
+    elif neg > pos:
+        dominant = "Negative"
+    else:
+        dominant = "Neutral"
+
+    data = {
+        "ticker": ticker,
+        "positive_pct": positive_pct,
+        "negative_pct": negative_pct,
+        "neutral_pct": neutral_pct,
+        "dominant_sentiment": dominant,
+        "article_count": len(articles),
+        "articles": articles,
+    }
+    _WEB_CACHE[ticker] = {"ts": now, "data": data}
+    return data
+
+
+@app.route("/internal/market/news-sentiment")
+def web_news_sentiment():
+    tickers_param = request.args.get("tickers", "")
+    if tickers_param:
+        tickers = [t.strip().upper() for t in tickers_param.split(",") if t.strip()]
+    else:
+        tickers = _DEFAULT_TICKERS
+
+    results = [None] * len(tickers)
+
+    def fetch(i, tk):
+        results[i] = _web_news_for_ticker(tk)
+
+    threads = [threading.Thread(target=fetch, args=(i, tk)) for i, tk in enumerate(tickers)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=12)
+
+    # Filter out None (timed-out) and return
+    output = [r for r in results if r is not None]
+    # Sort by positive_pct desc
+    output.sort(key=lambda x: x["positive_pct"], reverse=True)
+    return jsonify(output)
+
+
+@app.route("/internal/market/ticker-news/<ticker>")
+def web_ticker_news_single(ticker: str):
+    """Return web news sentiment for a single arbitrary ticker."""
+    data = _web_news_for_ticker(ticker.upper())
+    return jsonify(data)
+
+
+# ── News posts ─────────────────────────────────────────────────────────────────
+
+NEWS_FILE = Path(__file__).resolve().parents[1] / "data" / "news_posts.json"
+
+_news_posts: list = []
+
+def _load_news():
+    global _news_posts
+    try:
+        with open(NEWS_FILE, "r") as f:
+            _news_posts = json.load(f)
+        print(f"[classifier_service] Loaded {len(_news_posts)} news posts", flush=True)
+    except Exception as e:
+        print(f"[classifier_service] Failed to load news posts: {e}", flush=True)
+        _news_posts = []
+
+_load_news()
+
+
+_POSITIVE_WORDS = {
+    "beats","beat","surges","surge","surged","record","raises","raised","raise",
+    "jumps","jumped","jump","soars","soar","soared","profit","profits","growth","grows",
+    "wins","win","won","expands","expand","expanded","upgrade","upgrades","upgraded",
+    "buyback","dividend","strong","tops","best","exceeds","exceed","exceeded",
+    "climbs","climbed","climb","accelerates","accelerate","boosts","boost","boosted",
+    "gains","gain","gained","rises","rose","rise","doubles","doubled","double",
+    "surpasses","surpassed","outperforms","outperform","highest","record-breaking",
+    "tripled","triples","triple","accelerated","approval","approved",
+    "all-time","expands","expanding","broadens","momentum",
+    # Additional positive signals
+    "bullish","bull","rally","rallies","rallied","rebound","rebounded","rebounds",
+    "recovery","recover","recovered","breakout","breakthrough","milestone",
+    "outperformance","initiates","overweight","positive","opportunity","upside",
+    "optimistic","optimism","confident","confidence","acceleration","target","buy",
+    "strong-buy","investment-grade","returning","awarded","partnership","deal",
+    "renewed","buyout","acquisition","merger","synergies","market-share","leading",
+    "dominates","dominant","innovative","launch","launched","launches","deployed",
+    "ai","breakthrough","demand","exceeding","ahead","new","higher","higher-than",
+    "demands","infrastructure","capital","spending","invest","investing","investment",
+}
+
+_NEGATIVE_WORDS = {
+    "misses","miss","missed","falls","fall","fell","cuts","cut","layoffs","layoff",
+    "slashes","slash","slashed","drops","drop","dropped","declines","decline","declined",
+    "narrows","concern","delays","delay","delayed","fails",
+    "fail","failed","blocked","block","shrinks","shrink","shrunk","disappoints",
+    "disappoint","disappointing","collapses","collapse","collapsed","halts","halt",
+    "halted","withdraws","withdraw","withdrawn","plunges","plunge","plunged","sinks",
+    "sink","sank","tumbles","tumble","tumbled","weaker","weakness","weak","shortage",
+    "shortages","recall","recalls","investigation","probe","bankruptcy","crisis",
+    "restructuring","restructures","writedown","write-down","impairment","loss","losses"
+}
+
+
+def _classify_news_sentiment(headline: str) -> str:
+    words = set(headline.lower().replace("-", " ").split())
+    pos = len(words & _POSITIVE_WORDS)
+    neg = len(words & _NEGATIVE_WORDS)
+    if pos > neg:
+        return "Positive"
+    if neg > pos:
+        return "Negative"
+    # tie-break: scan for two-word signals
+    hl = headline.lower()
+    pos_phrases = ["beats estimates","beats expectations","record profit","record revenue",
+                   "raises guidance","raises outlook","strong quarter","record quarter"]
+    neg_phrases = ["misses estimates","misses expectations","cuts guidance","cuts outlook",
+                   "going concern","layoffs","job cuts","production halt","fails phase"]
+    pos_score = sum(1 for p in pos_phrases if p in hl)
+    neg_score = sum(1 for p in neg_phrases if p in hl)
+    if pos_score > neg_score:
+        return "Positive"
+    if neg_score > pos_score:
+        return "Negative"
+    return "Neutral"
+
+
+_TICKER_MAP = {
+    "apple":"AAPL","nvidia":"NVDA","microsoft":"MSFT","alphabet":"GOOGL","google":"GOOGL",
+    "meta":"META","amazon":"AMZN","tsmc":"TSM","oracle":"ORCL","palantir":"PLTR",
+    "reddit":"RDDT","goldman sachs":"GS","jpmorgan":"JPM","visa":"V","mastercard":"MA",
+    "costco":"COST","walmart":"WMT","unitedhealth":"UNH","eli lilly":"LLY","abbvie":"ABBV",
+    "advanced micro devices":"AMD","broadcom":"AVGO","crowdstrike":"CRWD",
+    "servicenow":"NOW","snowflake":"SNOW","uber":"UBER","spotify":"SPOT",
+    "netflix":"NFLX","disney":"DIS","bank of america":"BAC","tesla":"TSLA",
+    "intel":"INTC","alibaba":"BABA","pfizer":"PFE","merck":"MRK","beyond meat":"BYND",
+    "rivian":"RIVN","walgreens":"WBA","cvs":"CVS","nike":"NKE","starbucks":"SBUX",
+    "snap":"SNAP","paypal":"PYPL","coinbase":"COIN","boeing":"BA","gamestop":"GME",
+    "paramount":"PARA","doordash":"DASH","amc entertainment":"AMC","lucid":"LCID",
+    "riot platforms":"RIOT","etsy":"ETSY","lyft":"LYFT","ford":"F","exxonmobil":"XOM",
+    "chevron":"CVX","coca-cola":"KO","mcdonald":"MCD","general motors":"GM",
+    "pepsico":"PEP","berkshire":"BRK","arm holdings":"ARM","warner bros":"WB",
+    "jpmorgan chase":"JPM","goldman":"GS",
+}
+
+_ALL_TICKERS = [
+    "AAPL","NVDA","MSFT","GOOGL","META","AMZN","TSM","TSMC","ORCL","PLTR",
+    "RDDT","GS","JPM","V","MA","COST","WMT","UNH","LLY","ABBV","AMD","AVGO",
+    "CRWD","NOW","SNOW","UBER","SPOT","NFLX","DIS","BAC","TSLA","INTC","BABA",
+    "PFE","MRK","BYND","RIVN","WBA","CVS","NKE","SBUX","SNAP","PYPL","COIN",
+    "BA","GME","PARA","DASH","AMC","LCID","RIOT","ETSY","LYFT","F","XOM","CVX",
+    "KO","MCD","GM","PEP","BRK","ARM","ETSY","X","SPX","MU","BB","BX","IOT",
+    "MRVL","SPCE","APPS","HIMX","ASTS","LASE","HUT","NBIS","LITE","NOW","OKLO",
+    "PURR","RCAT","SPCX","TKO","USAR",
+]
+
+
+def _extract_ticker(headline: str) -> str | None:
+    import re
+    # 1. explicit $TICKER
+    m = re.search(r'\$([A-Z]{1,5})', headline)
+    if m:
+        return m.group(1)
+    # 2. standalone all-caps ticker in headline
+    hl_upper = headline.upper()
+    for tk in sorted(_ALL_TICKERS, key=len, reverse=True):
+        if re.search(rf'\b{tk}\b', hl_upper):
+            return tk
+    # 3. company name lookup
+    hl_lower = headline.lower()
+    for name, tk in sorted(_TICKER_MAP.items(), key=lambda x: -len(x[0])):
+        if name in hl_lower:
+            return tk
+    return None
+
+
+@app.route("/internal/news/posts")
+def news_posts():
+    return jsonify(_news_posts)
+
+
+@app.route("/internal/news/classify", methods=["POST"])
+def classify_news():
+    body = request.get_json(force=True)
+    headline = body.get("headline", "").strip()
+    if not headline:
+        return jsonify({"error": "headline is required"}), 400
+    ai_label = _classify_news_sentiment(headline)
+    ai_ticker = _extract_ticker(headline)
+    return jsonify({
+        "ai_label": ai_label,
+        "ai_ticker": ai_ticker,
+    })
+
+
+# ── Classify ───────────────────────────────────────────────────────────────────
+
+@app.route("/internal/classify", methods=["POST"])
+def classify():
+    body = request.get_json(force=True)
+    text = body.get("text", "").strip()
+    flair = body.get("flair")
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+    try:
+        result = classify_post(text, flair=flair)
+        return jsonify({
+            "sentiment": result["sentiment"],
+            "method": result["method"],
+            "ticker": result.get("ticker"),
+            "confidence": result["confidence"],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Broad Market Sentiment (100 articles from ETFs + indices) ───────────────────
+
+_BROAD_TICKERS = [
+    "SPY","QQQ","IWM","DIA","TLT",
+    "GLD","XLE","XLK","XLF","XLV",
+    "XLY","XLRE","VXX","USO","VTI",
+    "BTC-USD","^GSPC","^IXIC","^DJI","^VIX",
+]
+
+_BROAD_CACHE: dict = {"ts": 0, "data": None}
+_BROAD_TTL = 86_400  # 24 h
+
+
+@app.route("/internal/market/broad-sentiment")
+def broad_market_sentiment():
+    import time as _time
+    now = _time.time()
+    if now - _BROAD_CACHE["ts"] < _BROAD_TTL and _BROAD_CACHE["data"]:
+        return jsonify(_BROAD_CACHE["data"])
+
+    all_articles: list = []
+    results: list = [None] * len(_BROAD_TICKERS)
+
+    def fetch_etf(i, tk):
+        try:
+            raw = _web_fetch_news(tk, limit=8)
+            arts = []
+            for item in raw:
+                title = item.get("title", "").strip()
+                if title:
+                    arts.append({
+                        "title": title,
+                        "source": tk,
+                        "label": _classify_news_sentiment(title),
+                        "provider": item.get("provider", "Web"),
+                        "url": item.get("url", ""),
+                        "pub_date": item.get("pub_date", ""),
+                    })
+            results[i] = arts
+        except Exception:
+            results[i] = []
+
+    threads = [threading.Thread(target=fetch_etf, args=(i, tk)) for i, tk in enumerate(_BROAD_TICKERS)]
+    for th in threads: th.start()
+    for th in threads: th.join(timeout=18)
+
+    seen = set()
+    for group in results:
+        if group:
+            for a in group:
+                if a["title"] not in seen:
+                    seen.add(a["title"])
+                    all_articles.append(a)
+
+    pos = sum(1 for a in all_articles if a["label"] == "Positive")
+    neg = sum(1 for a in all_articles if a["label"] == "Negative")
+    neu = sum(1 for a in all_articles if a["label"] == "Neutral")
+    total = len(all_articles)
+    # Score = positive share of opinionated articles (ignore neutral)
+    opinionated = pos + neg or 1
+    score = round(pos / opinionated * 100)
+
+    data = {
+        "score": score,
+        "total_articles": total,
+        "positive_count": pos,
+        "negative_count": neg,
+        "neutral_count": neu,
+        "top_headlines": sorted(all_articles, key=lambda x: (0 if x["label"]=="Positive" else 1 if x["label"]=="Neutral" else 2)),
+    }
+    _BROAD_CACHE["ts"] = now
+    _BROAD_CACHE["data"] = data
+    return jsonify(data)
+
+
+# ── Daily Stock Picks ───────────────────────────────────────────────────────────
+
+# ── Dynamic Universe ────────────────────────────────────────────────────────────
+# Hardcoded fallbacks used when web fetching fails.
+_FALLBACK_LARGE = [
+    "AAPL","MSFT","NVDA","GOOGL","META","AMZN","AVGO","TSLA","ORCL","TSM",
+    "NOW","CRWD","PLTR","AMD","NET","DDOG","SHOP","TTD","ADBE","CRM","SNOW",
+    "JPM","V","MA","BX","AXP","GS","KKR","SCHW","PYPL","ICE","CME",
+    "LLY","ABBV","UNH","AMGN","ISRG","REGN","GILD","BSX","SYK",
+    "COST","HD","MCD","CMG","NKE","SBUX","LULU","BKNG","ABNB",
+    "XOM","CVX","CAT","GE","DE","NEE","OXY","FSLR","PWR",
+    "RDDT","CELH","MARA","HIMS","RKLB","IONQ","SOFI",
+    "MCO","SPGI","MSCI","CBOE","ANET","PANW","APP","FICO","FTNT",
+    "ASML","NFLX","INTU","KLAC","ROP","MELI","SE","NU",
+]
+_FALLBACK_SMALL_MID = [
+    "DUOL","CAVA","DXCM","WING","ELF","DECK","TMDX","PCOR",
+    "APPF","AXON","ENPH","GNRC","MEDP","ODFL","PODD","UPST",
+    "SMCI","SOUN","VRT","WFRD","CRDO","RXO","RVMD","TGTX",
+]
+
+_UNIVERSE_CACHE: dict = {"ts": 0.0, "large": [], "small_mid": []}
+_UNIVERSE_TTL = 86_400  # 24 h — re-fetch ticker lists once per day
+
+def _fetch_wiki_tickers(url: str, label: str) -> list:
+    """Scrape ticker symbols from a Wikipedia stock-list page (wikitable, first column)."""
+    import urllib.request, re
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read().decode("utf-8")
+
+        # Primary: anchor inside first-column td  →  <td><a ...>AAPL</a></td>
+        tickers = re.findall(
+            r'<td[^>]*>\s*<a\s[^>]*>([A-Z]{1,5}(?:\.[A-Z]{1,2})?)</a>\s*</td>',
+            html
+        )
+        # Secondary: bare td  →  <td>AAPL</td>
+        if len(tickers) < 20:
+            tickers = re.findall(r'<td>\s*([A-Z]{1,5})\s*</td>', html)
+
+        # Normalise BRK.B → BRK-B and filter junk
+        valid = []
+        seen_local: set = set()
+        for t in tickers:
+            t = t.replace(".", "-")
+            if re.match(r'^[A-Z]{1,5}(-[A-Z])?$', t) and t not in seen_local:
+                seen_local.add(t)
+                valid.append(t)
+
+        app.logger.info(f"[universe] {label}: {len(valid)} tickers from {url}")
+        return valid
+    except Exception as e:
+        app.logger.warning(f"[universe] {label} fetch failed: {e}")
+        return []
+
+def _get_universe() -> tuple:
+    """Return (large_cap_list, small_mid_cap_list), refreshed once per day."""
+    import time as _t
+    now = _t.time()
+    if now - _UNIVERSE_CACHE["ts"] < _UNIVERSE_TTL and len(_UNIVERSE_CACHE["large"]) >= 50:
+        return _UNIVERSE_CACHE["large"], _UNIVERSE_CACHE["small_mid"]
+
+    app.logger.info("[universe] Refreshing ticker universe from web...")
+
+    # S&P 500  (~500 large-cap)
+    sp500 = _fetch_wiki_tickers(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "S&P 500")
+    # NASDAQ-100 (~100, mostly overlaps S&P 500 but adds some tech)
+    ndx = _fetch_wiki_tickers(
+        "https://en.wikipedia.org/wiki/Nasdaq-100", "NASDAQ-100")
+    # S&P MidCap 400 (~400 mid-cap stocks)
+    mid400 = _fetch_wiki_tickers(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", "S&P 400 Mid-Cap")
+    # S&P SmallCap 600 (~600 small-cap stocks)
+    small600 = _fetch_wiki_tickers(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", "S&P 600 Small-Cap")
+
+    # Build large-cap universe (S&P 500 + NASDAQ-100 extras)
+    seen: set = set()
+    large: list = []
+    for t in sp500 + ndx:
+        if t not in seen:
+            seen.add(t)
+            large.append(t)
+
+    # Small/mid universe = S&P 400 mid + S&P 600 small, excluding large-cap
+    seen_sm: set = set(large)
+    small_mid: list = []
+    for t in mid400 + small600:
+        if t not in seen_sm:
+            seen_sm.add(t)
+            small_mid.append(t)
+
+    # Fall back to hardcoded lists if fetching produced too little
+    if len(large) < 50:
+        app.logger.warning("[universe] Large-cap fetch insufficient — using fallback list")
+        large = _FALLBACK_LARGE
+    if len(small_mid) < 20:
+        app.logger.warning("[universe] Small/mid fetch insufficient — using fallback list")
+        small_mid = _FALLBACK_SMALL_MID
+
+    _UNIVERSE_CACHE["ts"]        = now
+    _UNIVERSE_CACHE["large"]     = large
+    _UNIVERSE_CACHE["small_mid"] = small_mid
+    app.logger.info(
+        f"[universe] Ready: {len(large)} large-cap, {len(small_mid)} small/mid-cap"
+    )
+    return large, small_mid
+
+# How many candidates to score each day from each universe
+_PICKS_DAILY_SAMPLE     = 55  # score 55 → return top 10 (buffer for yfinance failures)
+_SPOTLIGHT_DAILY_SAMPLE = 14  # score 14 → return top 6
+
+# _PICKS_POOL / _SMALL_MID_CAP_POOL are called inside the picks endpoint
+# where shuffle is available; these shims are kept for the pre-warm path.
+def _PICKS_POOL():
+    large, _ = _get_universe()
+    import random as _r, datetime as _dt
+    seed = int(_dt.date.today().strftime("%Y%m%d")) + hash(str(large[0]) if large else "x")
+    return _r.Random(seed).sample(large, min(_PICKS_DAILY_SAMPLE, len(large)))
+
+def _SMALL_MID_CAP_POOL():
+    _, sm = _get_universe()
+    import random as _r, datetime as _dt
+    seed = int(_dt.date.today().strftime("%Y%m%d")) + hash(str(sm[0]) if sm else "y") + 1
+    return _r.Random(seed).sample(sm, min(_SPOTLIGHT_DAILY_SAMPLE, len(sm)))
+
+_PICKS_CACHE: dict = {"ts": 0, "data": None}
+_PICKS_TTL = 3600  # 1 hour
+
+
+def _score_for_picks(info: dict) -> float:
+    score = 0.0
+    current = info.get("currentPrice") or info.get("regularMarketPrice")
+    target = info.get("targetMeanPrice")
+
+    # Analyst Upside (0-15 pts): need ~30% upside for max
+    if target and current and current > 0:
+        upside = (target - current) / current
+        score += min(max(upside, 0) * 50, 15)
+
+    # Analyst Consensus (0-20 pts): 1=Strong Buy → 5=Strong Sell
+    rec = info.get("recommendationMean")
+    if rec:
+        score += max(0, (4.0 - rec) * 6.67)
+
+    # Profit Margin (0-15 pts)
+    pm = info.get("profitMargins")
+    if pm and pm > 0:
+        score += min(pm * 60, 15)
+
+    # Revenue Growth (0-15 pts)
+    rg = info.get("revenueGrowth")
+    if rg and rg > 0:
+        score += min(rg * 60, 15)
+
+    # Valuation — P/E + EV/EBITDA (0-15 pts combined)
+    pe = info.get("trailingPE")
+    pe_pts = 0
+    if pe and pe > 0:
+        if pe <= 20:   pe_pts = 8
+        elif pe <= 35: pe_pts = 5
+        elif pe <= 55: pe_pts = 2
+    ev_ebitda = info.get("enterpriseToEbitda")
+    ev_pts = 0
+    if ev_ebitda and ev_ebitda > 0:
+        if ev_ebitda < 10:   ev_pts = 7
+        elif ev_ebitda < 20: ev_pts = 4
+        elif ev_ebitda < 35: ev_pts = 2
+    score += pe_pts + ev_pts
+
+    # Total Debt — D/E ratio (0-10 pts; web data returns value × 100)
+    de = info.get("debtToEquity")
+    if de is not None:
+        if de < 50:    score += 10
+        elif de < 100: score += 7
+        elif de < 200: score += 4
+        elif de < 350: score += 2
+
+    # Free Cash Flow positive (0-10 pts)
+    if (info.get("freeCashflow") or 0) > 0:
+        score += 10
+
+    return round(score, 2)
+
+
+def _load_picks_from_disk():
+    """Load picks cache from disk so they survive deploys."""
+    import time
+    try:
+        if _PICKS_DISK_PATH.exists():
+            with open(_PICKS_DISK_PATH) as f:
+                blob = json.load(f)
+            if time.time() - blob["ts"] < _PICKS_TTL:
+                _PICKS_CACHE["ts"] = blob["ts"]
+                _PICKS_CACHE["data"] = blob["data"]
+                print("[classifier_service] Restored picks from disk cache.", flush=True)
+    except Exception as e:
+        print(f"[classifier_service] picks disk load failed: {e}", flush=True)
+
+
+def _load_detail_from_disk():
+    """Load stock detail cache from disk so it survives deploys."""
+    import time
+    try:
+        if _DETAIL_DISK_PATH.exists():
+            with open(_DETAIL_DISK_PATH) as f:
+                blob = json.load(f)
+            for ticker, entry in blob.items():
+                if time.time() - entry["ts"] < _DETAIL_CACHE_TTL:
+                    _DETAIL_CACHE[ticker] = entry
+            print(f"[classifier_service] Restored {_DETAIL_DISK_PATH} ({len(_DETAIL_CACHE)} tickers).", flush=True)
+    except Exception as e:
+        print(f"[classifier_service] detail disk load failed: {e}", flush=True)
+
+
+def _save_detail_to_disk():
+    """Save stock detail cache to disk."""
+    try:
+        with open(_DETAIL_DISK_PATH, "w") as f:
+            json.dump(_DETAIL_CACHE, f)
+    except Exception as e:
+        print(f"[classifier_service] detail disk save failed: {e}", flush=True)
+
+
+@app.route("/internal/stock/picks")
+def stock_picks_endpoint():
+    import time as _time, datetime as _dt
+    now   = _time.time()
+    today = _dt.date.today().isoformat()
+
+    # Optional shuffle offset — when non-zero the user wants a fresh rotation
+    shuffle = int(request.args.get("shuffle", 0))
+
+    def _cache_is_fresh(entry: dict) -> bool:
+        return (entry.get("data")
+                and entry.get("date") == today
+                and entry.get("shuffle", 0) == shuffle
+                and now - entry.get("ts", 0) < _PICKS_TTL)
+
+    if _cache_is_fresh(_PICKS_CACHE):
+        return jsonify(_PICKS_CACHE["data"])
+    # Fallback: disk cache — valid only for default (non-shuffled) requests today
+    if shuffle == 0 and _PICKS_DISK_PATH.exists():
+        try:
+            with open(_PICKS_DISK_PATH) as f:
+                blob = json.load(f)
+            if _cache_is_fresh(blob):
+                _PICKS_CACHE.update(blob)
+                print("[classifier_service] Served picks from disk cache.", flush=True)
+                return jsonify(blob["data"])
+        except Exception:
+            pass
+
+    # Resolve today's rotated pools from the dynamic universe (shuffle shifts the seed)
+    def _shuffled_pool(universe: list, n: int) -> list:
+        import random as _random
+        seed = int(today.replace("-", "")) + hash(str(universe[0]) if universe else "x") + shuffle * 9973
+        rng  = _random.Random(seed)
+        return rng.sample(universe, min(n, len(universe)))
+
+    large_universe, sm_universe = _get_universe()
+    today_pool    = _shuffled_pool(large_universe, _PICKS_DAILY_SAMPLE)
+    today_sm_pool = _shuffled_pool(sm_universe,    _SPOTLIGHT_DAILY_SAMPLE)
+
+    def _score_ticker(ticker: str) -> dict | None:
+        """Score a single ticker; returns None if data unavailable."""
+        import time as _t, random as _rand
+        # Small random jitter spreads Yahoo Finance requests across workers,
+        # avoiding the burst that triggers IP-level rate limiting.
+        _t.sleep(_rand.uniform(0.1, 0.5))
+        try:
+            summary  = _web_fetch_stock_summary(ticker)
+            info     = _web_extract_info(summary)
+            current  = info.get("currentPrice") or info.get("regularMarketPrice")
+            if not current:
+                return None
+            grade_s    = _compute_grade_score(info)
+            pick_score = _score_for_picks(info)
+            target     = info.get("targetMeanPrice")
+            upside     = ((target - current) / current * 100) if target and current else None
+            de_raw     = info.get("debtToEquity")
+            return {
+                "ticker":       ticker,
+                "name":         info.get("longName", ticker),
+                "sector":       info.get("sector", "Unknown"),
+                "industry":     info.get("industry", ""),
+                "price":        round(current, 2),
+                "change_pct":   info.get("regularMarketChangePercent"),
+                "target":       round(target, 2) if target else None,
+                "upside_pct":   round(upside, 1) if upside is not None else None,
+                "rec":          (info.get("recommendationKey") or "").replace("_", " ").title(),
+                "analyst_count":info.get("numberOfAnalystOpinions"),
+                "grade":        "A" if grade_s >= 85 else "B" if grade_s >= 70 else "C" if grade_s >= 55 else "D" if grade_s >= 40 else "F",
+                "grade_score":  grade_s,
+                "pe":           round(info["trailingPE"], 1) if info.get("trailingPE") else None,
+                "profit_margin":f"{round(info['profitMargins']*100,1)}%" if info.get("profitMargins") else None,
+                "debt_to_equity":round(de_raw / 100, 2) if de_raw is not None else None,
+                "revenue_growth":f"{round(info['revenueGrowth']*100,1)}%" if info.get("revenueGrowth") is not None else None,
+                "market_cap":   _fmt_big(info.get("marketCap")),
+                "score":        pick_score,
+            }
+        except Exception:
+            return None
+
+    # Score both pools through a shared rate-limited executor.
+    # max_workers=5 caps concurrent Yahoo Finance calls — avoids rate-limiting
+    # that kills all results when we fire 50+ threads simultaneously.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    all_tickers  = list(today_pool) + list(today_sm_pool)
+    large_count  = len(today_pool)
+    raw_results: list = [None] * len(all_tickers)
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_idx = {executor.submit(_score_ticker, tk): i
+                         for i, tk in enumerate(all_tickers)}
+        for future in as_completed(future_to_idx, timeout=60):
+            idx = future_to_idx[future]
+            try:
+                raw_results[idx] = future.result()
+            except Exception:
+                pass
+
+    scored    = raw_results[:large_count]
+    scored_sm = raw_results[large_count:]
+
+    valid = sorted([s for s in scored if s], key=lambda x: x["score"], reverse=True)
+    valid_sm = sorted([s for s in scored_sm if s], key=lambda x: x["score"], reverse=True)
+
+    # Pure score-based top 10 — no sector cap
+    picks = valid[:10]
+    # Top 6 small/mid cap spotlight
+    spotlight = valid_sm[:6]
+
+    # Build a grade map for ALL pool stocks so the frontend can use
+    # fundamentals scores on every chip, not just the top-10 picks.
+    grades = {s["ticker"]: s["grade_score"] for s in (scored + scored_sm) if s}
+
+    result = {"picks": picks, "spotlight": spotlight, "grades": grades}
+    _PICKS_CACHE["ts"]      = now
+    _PICKS_CACHE["date"]    = today
+    _PICKS_CACHE["shuffle"] = shuffle
+    _PICKS_CACHE["data"]    = result
+    # Persist to disk only for the default (non-shuffled) request
+    if shuffle == 0:
+        try:
+            with open(_PICKS_DISK_PATH, "w") as f:
+                json.dump({"ts": now, "date": today, "shuffle": 0, "data": result}, f)
+        except Exception as e:
+            print(f"[classifier_service] picks disk save failed: {e}", flush=True)
+    return jsonify(result)
+
+
+# ── Stock Detail ────────────────────────────────────────────────────────────────
+
+_DETAIL_CACHE: dict = {}
+_DETAIL_CACHE_TTL = 86_400  # 24 hours
+
+
+def _compute_grade_score(info: dict) -> int:
+    """0-100 composite fundamentals grade (aligned with pick-scoring philosophy)."""
+    score = 0
+
+    # P/E trailing — 0-15 pts (Valuation)
+    pe = info.get("trailingPE")
+    if pe and pe > 0:
+        if pe <= 20:   score += 15
+        elif pe <= 35: score += 10
+        elif pe <= 55: score += 5
+        else:          score += 1
+
+    # EV/EBITDA — 0-10 pts (Valuation)
+    ev_ebitda = info.get("enterpriseToEbitda")
+    if ev_ebitda and ev_ebitda > 0:
+        if ev_ebitda < 10:   score += 10
+        elif ev_ebitda < 20: score += 6
+        elif ev_ebitda < 35: score += 3
+
+    # Debt/Equity — 0-10 pts (web returns value × 100)
+    de = info.get("debtToEquity")
+    if de is not None:
+        if de < 50:    score += 10
+        elif de < 100: score += 7
+        elif de < 200: score += 4
+        else:          score += 1
+
+    # Free Cash Flow — 0-10 pts
+    fcf = info.get("freeCashflow")
+    if fcf is not None:
+        score += 10 if fcf > 0 else 0
+
+    # Profit Margin — 0-20 pts
+    pm = info.get("profitMargins")
+    if pm is not None:
+        if pm >= 0.30:   score += 20
+        elif pm >= 0.20: score += 15
+        elif pm >= 0.10: score += 10
+        elif pm >= 0:    score += 3
+
+    # Revenue Growth — 0-15 pts
+    rg = info.get("revenueGrowth")
+    if rg is not None:
+        if rg >= 0.20:   score += 15
+        elif rg >= 0.10: score += 10
+        elif rg >= 0.05: score += 6
+        elif rg >= 0:    score += 2
+
+    # Analyst Recommendation — 0-20 pts (1=Strong Buy, 5=Strong Sell)
+    rec = info.get("recommendationMean")
+    if rec is not None:
+        if rec <= 1.5:   score += 20
+        elif rec <= 2.0: score += 15
+        elif rec <= 2.5: score += 10
+        elif rec <= 3.0: score += 5
+        else:            score += 1
+
+    return min(100, score)
+
+
+def _fmt_big(n):
+    """Format large number as $1.2T / $800B / $45M."""
+    if n is None: return None
+    if abs(n) >= 1e12: return f"${n/1e12:.2f}T"
+    if abs(n) >= 1e9:  return f"${n/1e9:.1f}B"
+    if abs(n) >= 1e6:  return f"${n/1e6:.1f}M"
+    return f"${n:.0f}"
+
+
+@app.route("/internal/stock/detail/<ticker>")
+def stock_detail(ticker: str):
+    """Stock detail — fetch from web data with disk caching."""
+    tk = ticker.upper()
+    now = time.time()
+
+    # Check memory cache
+    cached = _DETAIL_CACHE.get(tk)
+    if cached and now - cached["ts"] < _DETAIL_CACHE_TTL:
+        return jsonify(cached["data"])
+
+    # Check disk cache
+    if _DETAIL_DISK_PATH.exists():
+        try:
+            with open(_DETAIL_DISK_PATH) as f:
+                blob = json.load(f)
+            entry = blob.get(tk)
+            if entry and now - entry["ts"] < _DETAIL_CACHE_TTL:
+                _DETAIL_CACHE[tk] = entry
+                return jsonify(entry["data"])
+        except Exception:
+            pass
+
+    # Fetch from web
+    summary = _web_fetch_stock_summary(tk)
+    chart_data = _web_fetch_chart(tk)
+    info = _web_extract_info(summary)
+
+    if not info.get("currentPrice") and not chart_data.get("price"):
+        return jsonify({"error": "not_found", "message": f"No data found for {tk}"}), 404
+
+    price = info.get("currentPrice") or chart_data.get("price")
+    change_pct = info.get("regularMarketChangePercent") or chart_data.get("change_pct")
+    name = info.get("longName", tk)
+    market_cap = info.get("marketCap")
+    w52_low = info.get("fiftyTwoWeekLow")
+    w52_high = info.get("fiftyTwoWeekHigh")
+    grade_s = _compute_grade_score(info)
+    grade = "A" if grade_s >= 85 else "B" if grade_s >= 70 else "C" if grade_s >= 55 else "D" if grade_s >= 40 else "F"
+
+    # crash resilience
+    cr = None
+    beta = info.get("beta")
+    pm = info.get("profitMargins")
+    de = info.get("debtToEquity")
+    if beta is not None or pm is not None or de is not None:
+        cr_pts = 0
+        if beta is not None:
+            cr_pts += (1 - min(beta, 2)/2) * 40
+        if pm is not None:
+            cr_pts += (pm * 100 if pm <= 1 else pm) * 0.3
+        if de is not None:
+            cr_pts += (1 - min(abs(de)/500, 1)) * 20
+        cr = "Strong" if cr_pts >= 55 else "Moderate" if cr_pts >= 35 else "Below Average" if cr_pts >= 18 else "Weak"
+
+    metrics = {
+        "market_cap": _fmt_big(market_cap),
+        "total_equity": _fmt_big(info.get("totalStockholderEquity")),
+        "total_debt": _fmt_big(info.get("totalDebt")),
+        "enterprise_value": _fmt_big(info.get("enterpriseValue")),
+        "pe_trailing": info.get("trailingPE"),
+        "pe_forward": info.get("forwardPE"),
+        "price_to_book": info.get("priceToBook"),
+        "eps": f"${info['trailingEps']:.2f}" if info.get("trailingEps") else None,
+        "dividend_yield": f"{round(info['dividendYield']*100,2)}%" if info.get("dividendYield") else None,
+        "profit_margin": f"{round(info['profitMargins']*100,1)}%" if info.get("profitMargins") else None,
+        "revenue_growth": f"{round(info['revenueGrowth']*100,1)}%" if info.get("revenueGrowth") is not None else None,
+        "debt_to_equity": round(de/100, 2) if de is not None else None,
+        "current_ratio": info.get("currentRatio"),
+        "quick_ratio": info.get("quickRatio"),
+        "roe": f"{round(info['returnOnEquity']*100,1)}%" if info.get("returnOnEquity") else None,
+        "roa": f"{round(info['returnOnAssets']*100,1)}%" if info.get("returnOnAssets") else None,
+        "beta": beta,
+        "operating_margin": f"{round(info['operatingMargins']*100,1)}%" if info.get("operatingMargins") else None,
+        "op_cash_flow": _fmt_big(info.get("operatingCashflow")),
+        "free_cash_flow": _fmt_big(info.get("freeCashflow")),
+        "earnings_growth": f"{round(info['earningsGrowth']*100,1)}%" if info.get("earningsGrowth") is not None else None,
+        "52w_high": w52_high,
+        "52w_low": w52_low,
+        "analyst_target": info.get("targetMeanPrice"),
+        "analyst_rec": (info.get("recommendationKey") or "").replace("_", " ").title() if info.get("recommendationKey") else None,
+        "analyst_count": info.get("numberOfAnalystOpinions"),
+        "crash_resilience": cr,
+    }
+
+    chart = chart_data.get("chart", [])
+    result = {
+        "ticker": tk,
+        "name": name,
+        "price": price,
+        "change_pct": change_pct,
+        "market_cap": _fmt_big(market_cap),
+        "week52_low": w52_low,
+        "week52_high": w52_high,
+        "chart": chart,
+        "grade": grade,
+        "grade_score": grade_s,
+        "metrics": metrics,
+    }
+
+    # Cache
+    entry = {"ts": now, "data": result}
+    _DETAIL_CACHE[tk] = entry
+    try:
+        blob = {}
+        if _DETAIL_DISK_PATH.exists():
+            with open(_DETAIL_DISK_PATH) as f:
+                blob = json.load(f)
+        blob[tk] = entry
+        with open(_DETAIL_DISK_PATH, "w") as f:
+            json.dump(blob, f)
+    except Exception as e:
+        print(f"[stock_detail] disk save failed: {e}", flush=True)
+
+    return jsonify(result)
+
+
+def _prewarm_picks():
+    """Score all picks pools at startup so the first user request hits cache.
+    If disk cache is fresh (<6h), skip the expensive work entirely."""
+    import time as _t
+    _t.sleep(3)  # let Flask finish starting up first
+    _load_picks_from_disk()
+    _load_detail_from_disk()  # also restore stock detail cache
+    if _PICKS_CACHE["data"]:
+        print("[classifier_service] Picks loaded from disk — skipping pre-warm.", flush=True)
+        return
+    print("[classifier_service] Pre-warming picks cache in background...", flush=True)
+    try:
+        with app.test_client() as c:
+            c.get("/internal/stock/picks")
+        print("[classifier_service] Picks cache warm.", flush=True)
+    except Exception as e:
+        print(f"[classifier_service] Pre-warm failed: {e}", flush=True)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PYTHON_SERVICE_PORT", 5100))
+    print(f"[classifier_service] Starting on port {port}", flush=True)
+    threading.Thread(target=_prewarm_picks, daemon=True).start()
+    app.run(host="0.0.0.0", port=port, debug=False)

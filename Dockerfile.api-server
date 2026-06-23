@@ -1,40 +1,30 @@
-FROM node:24-alpine
+FROM node:20-alpine
 
 WORKDIR /app
 
-# Install pnpm
+# install pnpm
 RUN npm install -g pnpm
 
-# Copy package files
+# copy only what we need
 COPY package.json .
 COPY pnpm-workspace.yaml .
 COPY tsconfig.json .
 COPY tsconfig.base.json .
 
-# Copy workspace code
 COPY lib ./lib
 COPY artifacts/api-server ./artifacts/api-server
-COPY scripts ./scripts
 
-# Install dependencies (clean + Render-safe)
-ENV PNPM_ENABLE_SCRIPTS=1
-ENV PNPM_CONFIG_IGNORE_SCRIPTS=false
-ENV PNPM_STRICT_PEER_DEPENDENCIES=false
-
+# install dependencies (simple mode)
 RUN pnpm install --no-frozen-lockfile
 
-# Build ONLY API server (IMPORTANT)
-RUN pnpm -C artifacts/api-server install
-RUN pnpm -C artifacts/api-server build
+# build ONLY api server
+RUN pnpm --filter api-server build || true
 
-# Expose API port
+# fallback: build directly if workspace filter fails
+RUN cd artifacts/api-server && pnpm install && pnpm run build
+
 EXPOSE 8080
 
-# Environment variables
 ENV PORT=8080
-ENV PYTHON_SERVICE_PORT=5100
-ENV PYTHON_SERVICE_HOST=classifier
-ENV BASE_PATH=/api
 
-# Start server
 CMD ["node", "artifacts/api-server/dist/index.js"]

@@ -5,7 +5,7 @@ WORKDIR /app
 # Install pnpm
 RUN npm install -g pnpm
 
-# Copy package files
+# Copy package files first (better Docker caching)
 COPY package.json .
 COPY pnpm-workspace.yaml .
 COPY tsconfig.json .
@@ -16,21 +16,24 @@ COPY lib ./lib
 COPY artifacts/api-server ./artifacts/api-server
 COPY scripts ./scripts
 
-# Install dependencies (FIXED for Render + pnpm + esbuild issue)
+# Install dependencies (Render-safe pnpm config)
 ENV PNPM_ENABLE_SCRIPTS=1
 ENV PNPM_CONFIG_IGNORE_SCRIPTS=false
 ENV PNPM_STRICT_PEER_DEPENDENCIES=false
 
 RUN pnpm install --no-frozen-lockfile
 
-# Build
+# Build API server
 RUN pnpm run build
 
+# Expose API port
 EXPOSE 8080
 
+# Environment variables
 ENV PORT=8080
 ENV PYTHON_SERVICE_PORT=5100
 ENV PYTHON_SERVICE_HOST=classifier
 ENV BASE_PATH=/api
 
+# Start server
 CMD ["node", "artifacts/api-server/dist/index.js"]

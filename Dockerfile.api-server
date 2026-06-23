@@ -14,17 +14,17 @@ COPY tsconfig.base.json .
 COPY lib ./lib
 COPY artifacts/api-server ./artifacts/api-server
 
-# install dependencies (simple mode)
+# install dependencies
 RUN pnpm install --no-frozen-lockfile
 
-# build ONLY api server
+# build API server
 RUN pnpm --filter api-server build || true
 
-# fallback: build directly if workspace filter fails
+# fallback build
 RUN cd artifacts/api-server && pnpm install && pnpm run build
 
 EXPOSE 8080
 
 ENV PORT=8080
 
-CMD ["node", "artifacts/api-server/dist/index.js"]
+CMD ["node", "artifacts/api-server/dist/index.mjs"]

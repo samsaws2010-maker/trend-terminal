@@ -16,15 +16,16 @@ COPY lib ./lib
 COPY artifacts/api-server ./artifacts/api-server
 COPY scripts ./scripts
 
-# Install dependencies (Render-safe pnpm config)
+# Install dependencies
 ENV PNPM_ENABLE_SCRIPTS=1
 ENV PNPM_CONFIG_IGNORE_SCRIPTS=false
 ENV PNPM_STRICT_PEER_DEPENDENCIES=false
 
 RUN pnpm install --no-frozen-lockfile
 
-# Build API server
-RUN pnpm run build
+# Build ONLY the API server (IMPORTANT FIX)
+RUN pnpm -C artifacts/api-server install
+RUN pnpm -C artifacts/api-server build
 
 # Expose API port
 EXPOSE 8080
